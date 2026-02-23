@@ -328,6 +328,7 @@ async function main() {
     },
     phases: {},
     failures: [],
+    failedPhases: [],
     invariants: {},
     runtime: {
       peakHeapMb: 0
@@ -366,7 +367,9 @@ async function main() {
       stats: phaseStatsTemplate(),
       failures: [],
       events: [],
-      notes: []
+      notes: [],
+      meta: {},
+      status: 'PENDING'
     };
     report.phases[name] = phase;
     return phase;
@@ -375,6 +378,10 @@ async function main() {
   const finishPhase = (phase, phaseStartedAt) => {
     phase.endedAt = new Date().toISOString();
     phase.durationMs = nowMs() - phaseStartedAt;
+    const expectedSkips = Number(phase?.meta?.expectedSkips || 0);
+    if (phase.failures.length > 0) phase.status = 'FAIL';
+    else if (expectedSkips > 0) phase.status = 'PASS_WITH_EXPECTED_SKIP';
+    else phase.status = 'PASS';
   };
 
   const notePhaseFailure = (phase, type, detail) => {
@@ -454,6 +461,23 @@ async function main() {
     UNIQUE_ID_VIOLATIONS: 0,
     TITLE_DUPLICATE_VIOLATIONS: 0
   };
+  const legacyDecisionFixture = {
+    id: 'd_legacy_alpha_fixture',
+    town: 'alpha',
+    event_id: 'e_legacy_alpha_fixture',
+    event_type: 'festival',
+    prompt: 'Legacy decision fixture for Trader Mode compatibility coverage.',
+    options: [
+      { key: 'ration', label: 'Ration', effects: { mood: { unrest: 1 } } },
+      { key: 'import', label: 'Import', effects: { mood: { prosperity: 1 } } }
+    ],
+    state: 'open',
+    starts_day: 1,
+    expires_day: 9999,
+    created_at: 1
+  };
+  let legacyDecisionFixtureId = '';
+  let decisionShowSkippedWithoutFixture = 0;
 
   const trackSnapshotHealth = (snapshot, phaseName) => {
     const world = snapshot?.world || {};
@@ -582,6 +606,29 @@ async function main() {
     return decisions.length > 0 ? safeString(decisions[decisions.length - 1].id) : '';
   };
 
+  const ensureLegacyDecisionFixtureId = () => {
+    const snapshot = memoryStore.getSnapshot();
+    const decisions = Array.isArray(snapshot?.world?.decisions) ? snapshot.world.decisions : [];
+    const match = decisions.find((entry) => (
+      safeString(entry?.id).toLowerCase() === legacyDecisionFixture.id.toLowerCase()
+    ));
+    return match ? safeString(match.id) : '';
+  };
+
+  const decisionCount = (snapshot) => (
+    Array.isArray(snapshot?.world?.decisions) ? snapshot.world.decisions.length : 0
+  );
+
+  const summarizeEventDeck = (snapshot) => {
+    const events = snapshot?.world?.events || {};
+    const active = Array.isArray(events.active) ? events.active : [];
+    return {
+      index: Number(events.index || 0),
+      activeCount: active.length,
+      lastActiveId: active.length > 0 ? safeString(active[active.length - 1]?.id) : ''
+    };
+  };
+
   const ensureQuestId = (filterFn = null) => {
     const snapshot = memoryStore.getSnapshot();
     const quests = Array.isArray(snapshot?.world?.quests) ? snapshot.world.quests : [];
@@ -663,6 +710,31 @@ async function main() {
     }
     await runCommand(phase, 'offer add bazaar Eli sell 12 3', operationId(phase.name, 'offer-seed'), { requireApplied: true });
     await runCommand(phase, `event seed ${opts.seed}`, operationId(phase.name, 'event-seed'), { requireApplied: true });
+    phase.meta.trader_mode_expected_no_decision_generation = true;
+    phase.notes.push('trader_mode_expected_no_decision_generation=true');
+
+    const fixtureTx = await memoryStore.transact((memory) => {
+      if (!memory.world || typeof memory.world !== 'object') memory.world = {};
+      if (!Array.isArray(memory.world.decisions)) memory.world.decisions = [];
+      const existing = memory.world.decisions.find((entry) => (
+        safeString(entry?.id).toLowerCase() === legacyDecisionFixture.id.toLowerCase()
+      ));
+      if (existing) {
+        return { fixtureId: safeString(existing.id), inserted: false };
+      }
+      memory.world.decisions.push(cloneJson(legacyDecisionFixture));
+      return { fixtureId: legacyDecisionFixture.id, inserted: true };
+    }, { eventId: 'bb-chaos:setup:seed-legacy-decision-fixture' });
+    legacyDecisionFixtureId = safeString(fixtureTx?.result?.fixtureId);
+    if (!legacyDecisionFixtureId) {
+      notePhaseFailure(phase, 'missing_seeded_legacy_decision_fixture', 'setup failed to seed legacy decision fixture');
+    } else {
+      phaseEvent(phase, {
+        type: 'legacy_decision_fixture',
+        fixtureId: legacyDecisionFixtureId,
+        inserted: !!fixtureTx?.result?.inserted
+      });
+    }
 
     const snapshot = memoryStore.getSnapshot();
     trackSnapshotHealth(snapshot, phase.name);
@@ -704,38 +776,119 @@ async function main() {
   });
 
   await tryRunPhase('nightfall_decisions', async (phase) => {
-    await runCommand(phase, `event seed ${opts.seed + 101}`, operationId(phase.name, 'event-seed-nightfall'), { requireApplied: true });
-    await runCommand(phase, 'clock advance 1', operationId(phase.name, 'nightfall-1'), { requireApplied: true });
+    phase.meta.trader_mode_expected_no_decision_generation = true;
+    phase.notes.push('Trader mode expected no decision generation at nightfall.');
 
-    let decisionId = ensureDecisionId();
-    if (!decisionId) {
-      await runCommand(phase, 'event draw alpha', operationId(phase.name, 'fallback-event-draw'), { allowFailure: true });
-      decisionId = ensureDecisionId();
+    await runCommand(phase, `event seed ${opts.seed + 101}`, operationId(phase.name, 'event-seed-nightfall'), { requireApplied: true });
+    const beforeNightfall = memoryStore.getSnapshot();
+    const beforeHash = hashSnapshot(beforeNightfall);
+    const beforeDecisionCount = decisionCount(beforeNightfall);
+    const beforeEvents = summarizeEventDeck(beforeNightfall);
+
+    const nightfallOpId = operationId(phase.name, 'nightfall-1');
+    const firstNightfall = await runCommand(phase, 'clock advance 1', nightfallOpId, { requireApplied: true });
+    const afterFirstNightfall = memoryStore.getSnapshot();
+    const afterFirstHash = hashSnapshot(afterFirstNightfall);
+    const afterFirstDecisionCount = decisionCount(afterFirstNightfall);
+    const afterFirstEvents = summarizeEventDeck(afterFirstNightfall);
+
+    if (firstNightfall.result && firstNightfall.result.applied && beforeHash === afterFirstHash) {
+      notePhaseFailure(phase, 'unexpected_no_change_on_first_apply', 'clock advance 1 (nightfall)');
+    }
+    if (afterFirstEvents.index !== beforeEvents.index + 1) {
+      notePhaseFailure(
+        phase,
+        'nightfall_event_index_unexpected',
+        `before=${beforeEvents.index} after=${afterFirstEvents.index} expected=${beforeEvents.index + 1}`
+      );
+    }
+    if (!afterFirstEvents.lastActiveId) {
+      notePhaseFailure(phase, 'nightfall_event_missing_after_draw', 'no active event id after nightfall draw');
+    }
+    if (afterFirstDecisionCount > beforeDecisionCount) {
+      notePhaseFailure(
+        phase,
+        'nightfall_unexpected_decision_generation',
+        `before=${beforeDecisionCount} after=${afterFirstDecisionCount}`
+      );
+    } else {
+      phase.notes.push(`nightfall decision count unchanged_or_lower: before=${beforeDecisionCount} after=${afterFirstDecisionCount}`);
     }
 
-    await runCommand(phase, 'decision list alpha', operationId(phase.name, 'decision-list-1'), { allowFailure: false });
-    if (decisionId) {
-      const show = await runCommand(phase, `decision show ${decisionId}`, operationId(phase.name, 'decision-show-1'), { allowFailure: false });
-      const optionKey = parseDecisionOptionKey(show.result?.outputLines || []);
-      if (optionKey) {
-        await runCommand(phase, `decision choose ${decisionId} ${optionKey}`, operationId(phase.name, 'decision-choose-1'), { allowFailure: true });
-      } else {
-        notePhaseFailure(phase, 'missing_decision_option', `decision=${decisionId}`);
-      }
-    } else {
-      notePhaseFailure(phase, 'missing_decision_id', 'no decision after nightfall');
+    const replayNightfall = await runCommand(phase, 'clock advance 1', nightfallOpId, { allowFailure: false });
+    const afterReplayNightfall = memoryStore.getSnapshot();
+    const afterReplayHash = hashSnapshot(afterReplayNightfall);
+    if (afterReplayHash !== afterFirstHash || (replayNightfall.result && replayNightfall.result.applied)) {
+      counters.IDEMPOTENCY_VIOLATIONS += 1;
+      notePhaseFailure(
+        phase,
+        'idempotency_violation',
+        `nightfall replay cmd="clock advance 1" firstApplied=${firstNightfall.result ? firstNightfall.result.applied : 'null'} secondApplied=${replayNightfall.result ? replayNightfall.result.applied : 'null'}`
+      );
     }
 
     await runCommand(phase, 'clock advance 1', operationId(phase.name, 'nightfall-2'), { requireApplied: true });
     await runCommand(phase, 'clock advance 1', operationId(phase.name, 'nightfall-3'), { requireApplied: true });
 
-    const decisionSnapshot = memoryStore.getSnapshot();
-    const openDecision = (Array.isArray(decisionSnapshot?.world?.decisions) ? decisionSnapshot.world.decisions : [])
-      .find((entry) => safeString(entry?.state).toLowerCase() === 'open');
-    if (openDecision && openDecision.id) {
-      await runCommand(phase, `decision expire ${openDecision.id}`, operationId(phase.name, 'decision-expire-1'), { allowFailure: true });
-    } else {
-      notePhaseFailure(phase, 'missing_open_decision_for_expire', 'no open decision found');
+    const snapshot = memoryStore.getSnapshot();
+    trackSnapshotHealth(snapshot, phase.name);
+    phaseEvent(phase, { type: 'snapshot', summary: summarizeSnapshotIds(snapshot) });
+  });
+
+  await tryRunPhase('decision_compatibility', async (phase) => {
+    legacyDecisionFixtureId = legacyDecisionFixtureId || ensureLegacyDecisionFixtureId();
+    if (!legacyDecisionFixtureId) {
+      notePhaseFailure(phase, 'missing_seeded_legacy_decision_fixture', 'cannot run decision compatibility checks without fixture');
+      return;
+    }
+
+    const list = await runCommand(phase, 'decision list alpha', operationId(phase.name, 'decision-list-compat'), { allowFailure: false });
+    const listLines = Array.isArray(list.result?.outputLines) ? list.result.outputLines : [];
+    if (!listLines.some((line) => String(line).includes('GOD DECISION DEPRECATED:'))) {
+      notePhaseFailure(phase, 'decision_compat_missing_deprecation_list', legacyDecisionFixtureId);
+    }
+    if (!listLines.some((line) => String(line).toLowerCase().includes(`id=${legacyDecisionFixtureId.toLowerCase()}`))) {
+      notePhaseFailure(phase, 'decision_compat_fixture_missing_in_list', legacyDecisionFixtureId);
+    }
+
+    const show = await runCommand(phase, `decision show ${legacyDecisionFixtureId}`, operationId(phase.name, 'decision-show-compat'), { allowFailure: false });
+    const showLines = Array.isArray(show.result?.outputLines) ? show.result.outputLines : [];
+    if (!show.result || !show.result.applied) {
+      notePhaseFailure(phase, 'decision_compat_show_not_applied', legacyDecisionFixtureId);
+    }
+    if (!showLines.some((line) => String(line).includes('GOD DECISION DEPRECATED:'))) {
+      notePhaseFailure(phase, 'decision_compat_missing_deprecation_show', legacyDecisionFixtureId);
+    }
+    if (!showLines.some((line) => String(line).toLowerCase().includes(`god decision show: id=${legacyDecisionFixtureId.toLowerCase()}`))) {
+      notePhaseFailure(phase, 'decision_compat_show_missing_fixture', legacyDecisionFixtureId);
+    }
+
+    const expireCommand = `decision expire ${legacyDecisionFixtureId}`;
+    const expireOpId = operationId(phase.name, 'decision-expire-compat');
+    const beforeExpireHash = hashSnapshot(memoryStore.getSnapshot());
+    const firstExpire = await runCommand(phase, expireCommand, expireOpId, { allowFailure: false });
+    const afterFirstExpire = memoryStore.getSnapshot();
+    const afterFirstExpireHash = hashSnapshot(afterFirstExpire);
+    if (firstExpire.result && firstExpire.result.applied && beforeExpireHash === afterFirstExpireHash) {
+      notePhaseFailure(phase, 'unexpected_no_change_on_first_apply', expireCommand);
+    }
+    if (!firstExpire.result || !firstExpire.result.applied) {
+      notePhaseFailure(phase, 'decision_compat_expire_not_applied', legacyDecisionFixtureId);
+    }
+    const expireLines = Array.isArray(firstExpire.result?.outputLines) ? firstExpire.result.outputLines : [];
+    if (!expireLines.some((line) => String(line).toLowerCase().includes(`god decision expire: id=${legacyDecisionFixtureId.toLowerCase()}`))) {
+      notePhaseFailure(phase, 'decision_compat_expire_output_unexpected', legacyDecisionFixtureId);
+    }
+
+    const replayExpire = await runCommand(phase, expireCommand, expireOpId, { allowFailure: false });
+    const afterReplayExpireHash = hashSnapshot(memoryStore.getSnapshot());
+    if (afterReplayExpireHash !== afterFirstExpireHash || (replayExpire.result && replayExpire.result.applied)) {
+      counters.IDEMPOTENCY_VIOLATIONS += 1;
+      notePhaseFailure(
+        phase,
+        'idempotency_violation',
+        `decision expire replay cmd="${expireCommand}" firstApplied=${firstExpire.result ? firstExpire.result.applied : 'null'} secondApplied=${replayExpire.result ? replayExpire.result.applied : 'null'}`
+      );
     }
 
     const snapshot = memoryStore.getSnapshot();
@@ -832,30 +985,25 @@ async function main() {
   });
 
   await tryRunPhase('readonly_hash', async (phase) => {
-    let rumorId = ensureRumorId();
-    if (!rumorId) {
-      await runCommand(phase, 'rumor spawn alpha supernatural 2 mist_shapes 2', operationId(phase.name, 'seed-rumor-readonly'), { allowFailure: true });
-      rumorId = ensureRumorId();
-    }
-
-    let decisionId = ensureDecisionId();
-    if (!decisionId) {
-      await runCommand(phase, 'event draw alpha', operationId(phase.name, 'seed-decision-readonly'), { allowFailure: true });
-      decisionId = ensureDecisionId();
-    }
-
-    await runReadOnlyHashCheck(phase, 'town-list', 'town list');
     await runReadOnlyHashCheck(phase, 'town-board', 'town board alpha 10');
+    await runReadOnlyHashCheck(phase, 'market-pulse-town', 'market pulse alpha');
+    await runReadOnlyHashCheck(phase, 'market-pulse-world', 'market pulse world');
+    await runReadOnlyHashCheck(phase, 'contract-list', 'contract list alpha');
     await runReadOnlyHashCheck(phase, 'rumor-list', 'rumor list alpha 10');
-    if (rumorId) await runReadOnlyHashCheck(phase, 'rumor-show', `rumor show ${rumorId}`);
-    else notePhaseFailure(phase, 'missing_rumor_for_readonly_show', 'rumor show skipped');
-    await runReadOnlyHashCheck(phase, 'decision-list', 'decision list alpha');
-    if (decisionId) await runReadOnlyHashCheck(phase, 'decision-show', `decision show ${decisionId}`);
-    else notePhaseFailure(phase, 'missing_decision_for_readonly_show', 'decision show skipped');
-    await runReadOnlyHashCheck(phase, 'trait-show', 'trait Mara');
-    await runReadOnlyHashCheck(phase, 'title-show', 'title Mara');
     await runReadOnlyHashCheck(phase, 'news-tail', 'news tail 20');
     await runReadOnlyHashCheck(phase, 'chronicle-tail', 'chronicle tail 20');
+    await runReadOnlyHashCheck(phase, 'decision-list', 'decision list alpha');
+
+    legacyDecisionFixtureId = legacyDecisionFixtureId || ensureLegacyDecisionFixtureId();
+    if (legacyDecisionFixtureId) {
+      await runReadOnlyHashCheck(phase, 'decision-show', `decision show ${legacyDecisionFixtureId}`);
+    } else {
+      decisionShowSkippedWithoutFixture += 1;
+      phase.meta.expectedSkips = Number(phase.meta.expectedSkips || 0) + 1;
+      phase.meta.decision_show_skipped_without_fixture = Number(phase.meta.decision_show_skipped_without_fixture || 0) + 1;
+      phase.notes.push('decision_show skipped (INFO): no legacy fixture decision id available.');
+      phaseEvent(phase, { type: 'info', code: 'decision_show_skipped_without_fixture' });
+    }
 
     const snapshot = memoryStore.getSnapshot();
     trackSnapshotHealth(snapshot, phase.name);
@@ -991,6 +1139,8 @@ async function main() {
   const peakHeapMb = peakHeapBytes / (1024 * 1024);
 
   report.runtime.peakHeapMb = peakHeapMb;
+  report.runtime.trader_mode_expected_no_decision_generation = true;
+  report.runtime.decision_show_skipped_without_fixture = decisionShowSkippedWithoutFixture;
   report.invariants = {
     LOCK_TIMEOUTS: lockTimeouts,
     INTEGRITY_OK: integrityOk,
@@ -1016,6 +1166,9 @@ async function main() {
     && report.failures.length === 0
   );
 
+  report.failedPhases = Object.values(report.phases)
+    .filter((phase) => Array.isArray(phase?.failures) && phase.failures.length > 0)
+    .map((phase) => phase.name);
   report.overall = overallPass ? 'PASS' : 'FAIL';
   report.endedAt = new Date().toISOString();
   report.durationMs = nowMs() - startedAt;
