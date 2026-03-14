@@ -39,6 +39,39 @@ npm install
 npm test
 ```
 
+## Run SQLite Seam Tests
+
+These tests launch the real engine as a child process and talk only over the
+canonical JSON-line stdin/stdout protocol. The suite defaults to the
+SQLite-authoritative backend.
+
+Preferred configuration:
+
+```powershell
+$env:ENGINE_ENTRY_PATH="C:\Users\the10\Projects\minecraft-god-mvp\src\index.js"
+npm run test:blackbox:sqlite
+```
+
+Fallback engine location options:
+
+1. `ENGINE_ENTRY_PATH`
+2. `PUBLIC_REPO_DIR`
+3. `blackbox.config.json`
+
+Optional environment knobs:
+
+- `BACKEND=sqlite` (default)
+- `TEMP_DIR=<base temp folder for seeded db/state files>`
+- `LOG_MIN_LEVEL=error` (default in the harness)
+
+The seam-level suite covers:
+
+- golden retrieval, execution, and mixed retrieval/execution sessions
+- idempotency replay in-process and across restart
+- crash-window recovery convergence against the same sqlite db
+- noisy stdout filtering for prompt/log tolerant parsing
+- malformed and truncated input tolerance
+
 ## Run Chaos Harness
 
 ```bash

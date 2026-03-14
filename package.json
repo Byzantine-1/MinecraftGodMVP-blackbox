@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "test": "node --test --test-concurrency=1",
+    "test:blackbox:sqlite": "node --test --test-concurrency=1 test/blackbox/*.test.js",
     "bb:wonky": "node --test --test-concurrency=1 test/30-wonkyCommandStorm.blackbox.test.js test/31-crashResumeDuringStorm.blackbox.test.js test/32-replayStormFocused.blackbox.test.js",
     "test:chaos": "node scripts/chaosHarness.js"
   }
